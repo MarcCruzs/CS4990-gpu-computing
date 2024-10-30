@@ -52,43 +52,46 @@ __global__ void matrixMulKernel_1thread1element(int m, int k, int n, const float
 }
 
 __global__ void matrixMulKernel_tiled(int m, int k, int n, const float *A_d, const float *B_d, float *C_d, unsigned Adz_sz, unsigned Bdz_sz) {
-    __shared__ float A_s[TILE_DIM][TILE_DIM];
-    __shared__ float B_s[TILE_DIM][TILE_DIM];
+    extern __shared__ float As_Bs[];
+
+    float* A_s = (float*) As_Bs;
+    float* B_s = (float*) As_Bs + Adz_sz + Bdz_sz;
 
     unsigned int row = blockIdx.y * TILE_DIM + threadIdx.y;
     unsigned int col = blockIdx.x * TILE_DIM + threadIdx.x;
 
     float sum = 0.0f;
 
-    // Loop over tiles of the input matrices
     for (unsigned int tile = 0; tile < (k + TILE_DIM - 1) / TILE_DIM; ++tile) {
-        // Load elements of the current tile of A and B into shared memory
+        // Load elements of the current tile of A into shared memory
         if (row < m && (tile * TILE_DIM + threadIdx.x) < k) {
-            A_s[threadIdx.y][threadIdx.x] = A_d[row * k + tile * TILE_DIM + threadIdx.x];
+            A_s[threadIdx.y * TILE_DIM + threadIdx.x] = A_d[row * k + tile * TILE_DIM + threadIdx.x];
         } else {
-            A_s[threadIdx.y][threadIdx.x] = 0.0f;
+            A_s[threadIdx.y * TILE_DIM + threadIdx.x] = 0.0f;
         }
 
+        // Load elements of the current tile of B into shared memory
         if (col < n && (tile * TILE_DIM + threadIdx.y) < k) {
-            B_s[threadIdx.y][threadIdx.x] = B_d[(tile * TILE_DIM + threadIdx.y) * n + col];
+            B_s[threadIdx.y * TILE_DIM + threadIdx.x] = B_d[(tile * TILE_DIM + threadIdx.y) * n + col];
         } else {
-            B_s[threadIdx.y][threadIdx.x] = 0.0f;
+            B_s[threadIdx.y * TILE_DIM + threadIdx.x] = 0.0f;
         }
 
         __syncthreads();
 
+        // Accumulate the results
         for (unsigned int i = 0; i < TILE_DIM; ++i) {
-            sum += A_s[threadIdx.y][i] * B_s[i][threadIdx.x];
+            sum += A_s[threadIdx.y * TILE_DIM + i] * B_s[i * TILE_DIM + threadIdx.x];
         }
 
         __syncthreads();
     }
 
-    // Store the computed value in the output matrix if within bounds
     if (row < m && col < n) {
         C_d[row * n + col] = sum;
     }
 }
+
 
 void basicSgemm_d_1thread1element(int m, int k, int n, const float *A_h, const float *B_h, float* C_h){
     double startTime, endTime;
@@ -142,20 +145,6 @@ void basicSgemm_d_1thread1element(int m, int k, int n, const float *A_h, const f
     CHECK(cudaFree(C_d));
 }
 
-// size_t calculate_appropriate_SM_usage (int TILE_DIM, size_t elementSize, int numMatrices, size_t sharedMemPerBlock) {
-//     size_t memoryPerTile = TILE_DIM * TILE_DIM * elementSize;
-
-//     size_t totalSharedMemory = memoryPerTile * numMatrices;
-
-//     if (totalSharedMemory > sharedMemPerBlock) {
-//         std::cerr << "Error: Required shared memory (" << totalSharedMemory
-//                   << " bytes) exceeds the device limit (" << sharedMemPerBlock << " bytes)." << std::endl;
-//         return 0; 
-//     }
-
-//     return totalSharedMemory;
-// }
-
 void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h, float* C_h) {
     double startTime, endTime;
 
@@ -165,11 +154,8 @@ void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h
 
     // calculating appropriate SM usage
     CHECK(cudaGetDeviceProperties(&devProp, 0));
-    size_t elementSize = sizeof(float);
-    int numMatrices = 2;
     size_t sharedMemPerBlock = devProp.sharedMemPerBlock;
-    size_t memoryPerTile = TILE_DIM * TILE_DIM * elementSize;
-    size_t size = memoryPerTile * numMatrices;
+    size_t size = 2 * TILE_DIM * TILE_DIM * sizeof(float);
 
     if (size > sharedMemPerBlock) {
         std::cerr << "Error: Required shared memory (" << size
@@ -202,11 +188,11 @@ void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h
     dim3 gridDim((n + blockDim.x - 1) / blockDim.x, (m + blockDim.y - 1) / blockDim.y); 
 
     startTime = myCPUTimer();
-    matrixMulKernel_tiled<<<gridDim, blockDim>>>(m, k, n, A_d, B_d, C_d, size / 2, size / 2);
+    matrixMulKernel_tiled<<<gridDim, blockDim, size>>>(m, k, n, A_d, B_d, C_d, TILE_DIM * TILE_DIM, TILE_DIM * TILE_DIM);
     CHECK(cudaDeviceSynchronize());
     endTime = myCPUTimer();
 
-    printf("    matrixMulKernel_tiled<<<(%d, %d),(%d, %d)>>>:                                   %f s\n", gridDim.x, gridDim.y, blockDim.x, blockDim.y, endTime - startTime);
+    printf("    matrixMulKernel_tiled<<<(%d, %d, %d),(%d, %d, %d),(%d)>>>:                                   %f s\n", gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, size, endTime - startTime);
     fflush(stdout);
 
     // (4) Copy the result data from the device memory to the host memory

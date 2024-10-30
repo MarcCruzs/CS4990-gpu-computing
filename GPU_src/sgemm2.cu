@@ -1,6 +1,8 @@
 #include<stdio.h>
 #include<stdlib.h>
 #include<sys/time.h>
+#include <cuda_runtime.h>
+#include <iostream>
 
 #define BLOCK_SIZE 16
 #define TILE_DIM 16
@@ -140,20 +142,45 @@ void basicSgemm_d_1thread1element(int m, int k, int n, const float *A_h, const f
     CHECK(cudaFree(C_d));
 }
 
-void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h, float* C_h){
+// size_t calculate_appropriate_SM_usage (int TILE_DIM, size_t elementSize, int numMatrices, size_t sharedMemPerBlock) {
+//     size_t memoryPerTile = TILE_DIM * TILE_DIM * elementSize;
+
+//     size_t totalSharedMemory = memoryPerTile * numMatrices;
+
+//     if (totalSharedMemory > sharedMemPerBlock) {
+//         std::cerr << "Error: Required shared memory (" << totalSharedMemory
+//                   << " bytes) exceeds the device limit (" << sharedMemPerBlock << " bytes)." << std::endl;
+//         return 0; 
+//     }
+
+//     return totalSharedMemory;
+// }
+
+void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h, float* C_h) {
     double startTime, endTime;
-    
+
     // (1) Allocate device memory
     float *A_d, *B_d, *C_d;
     cudaDeviceProp devProp;
-    cudaGetDeviceProperties(&devProp, 0);
-    
-    size_t size = calculate_appropriate_SM_usage(TILE_DIM, elementSize, numMatrices, devProp.sharedMemPerBlock);
+
+    // calculating appropriate SM usage
+    CHECK(cudaGetDeviceProperties(&devProp, 0));
+    size_t elementSize = sizeof(float);
+    int numMatrices = 2;
+    size_t sharedMemPerBlock = devProp.sharedMemPerBlock;
+    size_t memoryPerTile = TILE_DIM * TILE_DIM * elementSize;
+    size_t size = memoryPerTile * numMatrices;
+
+    if (size > sharedMemPerBlock) {
+        std::cerr << "Error: Required shared memory (" << size
+                << " bytes) exceeds the device limit (" << sharedMemPerBlock << " bytes)." << std::endl;
+        return; 
+    }
 
     startTime = myCPUTimer();
-    CHECK(cudaMalloc((void**) &A_d, sizeof(float) * m * k));
-    CHECK(cudaMalloc((void**) &B_d, sizeof(float) * k * n));
-    CHECK(cudaMalloc((void**) &C_d, sizeof(float) * m * n));
+    CHECK(cudaMalloc((void**)&A_d, sizeof(float) * m * k));
+    CHECK(cudaMalloc((void**)&B_d, sizeof(float) * k * n));
+    CHECK(cudaMalloc((void**)&C_d, sizeof(float) * m * n));
     cudaDeviceSynchronize();
     endTime = myCPUTimer();
 
@@ -175,11 +202,11 @@ void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h
     dim3 gridDim((n + blockDim.x - 1) / blockDim.x, (m + blockDim.y - 1) / blockDim.y); 
 
     startTime = myCPUTimer();
-    matrixMulKernel_tiled<<<gridDim, blockDim>>>(m, k, n, A_d, B_d, C_d, size/2, size/2);
+    matrixMulKernel_tiled<<<gridDim, blockDim>>>(m, k, n, A_d, B_d, C_d, size / 2, size / 2);
     CHECK(cudaDeviceSynchronize());
     endTime = myCPUTimer();
 
-    printf("    matrixMulKernel_tiled<<<(%d, %d, %d),(%d, %d, %d)>>>:                   %f s\n", gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, endTime - startTime);
+    printf("    matrixMulKernel_tiled<<<(%d, %d),(%d, %d)>>>:                                   %f s\n", gridDim.x, gridDim.y, blockDim.x, blockDim.y, endTime - startTime);
     fflush(stdout);
 
     // (4) Copy the result data from the device memory to the host memory
@@ -196,6 +223,7 @@ void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h
     CHECK(cudaFree(C_d));
 }
 
+
 bool verify(float* CPU_Answer, float* GPU_Answer, unsigned int nRows, unsigned int nCols) {
     unsigned int total = nRows * nCols; 
     const float tolerance = 1e-3;
@@ -208,21 +236,6 @@ bool verify(float* CPU_Answer, float* GPU_Answer, unsigned int nRows, unsigned i
     }
     return true;
 }
-
-size_t calculate_appropriate_SM_usage(int TILE_DIM, size_t elementSize, int numMatrices, size_t sharedMemPerBlock) {
-    size_t memoryPerTile = TILE_DIM * TILE_DIM * elementSize;
-
-    size_t totalSharedMemory = memoryPerTile * numMatrices;
-
-    if (totalSharedMemory > sharedMemPerBlock) {
-        std::cerr << "Error: Required shared memory (" << totalSharedMemory
-                  << " bytes) exceeds the device limit (" << sharedMemPerBlock << " bytes)." << std::endl;
-        return 0; 
-    }
-
-    return totalSharedMemory;
-}
-
 
 int main( int argc, char** argv){
     // setting dimensions (m * k * n)
@@ -269,16 +282,16 @@ int main( int argc, char** argv){
     printf("basicSgemm_d_1thread1element (GPU):                                                  %f s\n\n", endTime -startTime);
     fflush(stdout);
 
-    // basicSgemm_d_1thread1column (GPU)
+    // basicSgemm_d_1thread1element (GPU)
     startTime = myCPUTimer();
-    basicSgemm_d_1thread1column(m, k, n, A_h, B_h, C_h);
+    basicSgemm_d_tiled(m, k, n, A_h, B_h, C_h);
     endTime = myCPUTimer();
 
     isVerified = verify(CPU_Answer, C_h, m, n);
-    printf("    Verified Results:                                                                %s\n", isVerified ? "SUCCESS" : "FAILED");
+    printf("    Verification Results:                                                            %s\n", isVerified ? "SUCCESS" : "FAILED");
     fflush(stdout);
 
-    printf("basicSgemm_d_tiled (GPU):                                                   %f s\n\n", endTime -startTime);
+    printf("basicSgemm_d_tiled (GPU):                                                            %f s\n\n", endTime -startTime);
     fflush(stdout);
 
     free(A_h);

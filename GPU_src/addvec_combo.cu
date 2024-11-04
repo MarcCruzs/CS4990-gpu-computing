@@ -32,7 +32,7 @@ __global__ void vecAddKernel(float *x_d, float *y_d, float *z_d, unsigned int n)
 }
 
 int main( int argc, char** argv){
-    unsigned int n = 1024;
+    unsigned int n = 16777216;
 
     float* x_h = (float*) malloc(sizeof(float)*n);
     for(unsigned int i = 0; i < n; i++){
@@ -61,7 +61,7 @@ int main( int argc, char** argv){
 
     startTime = myCPUTimer();
     vecAddKernel<<<ceil(n/256.0), 256>>>(x_d, y_d, z_d, n);
-    CHECK(cudaDeviceSynchronize());
+    cudaDeviceSynchronize();
     endTime = myCPUTimer();
 
     printf("CUDA Kernal: %f s\n", endTime - startTime);

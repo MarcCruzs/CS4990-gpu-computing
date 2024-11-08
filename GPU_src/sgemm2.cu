@@ -1,6 +1,8 @@
 #include<stdio.h>
 #include<stdlib.h>
 #include<sys/time.h>
+#include <cuda_runtime.h>
+#include <iostream>
 
 #define BLOCK_SIZE 16
 
@@ -49,35 +51,35 @@ __global__ void matrixMulKernel_1thread1element(int m, int k, int n, const float
 }
 
 __global__ void matrixMulKernel_tiled(int m, int k, int n, const float *A_d, const float *B_d, float *C_d, unsigned Adz_sz, unsigned Bdz_sz) {
-    __shared__ float A_s[TILE_DIM][TILE_DIM];
-    __shared__ float B_s[TILE_DIM][TILE_DIM];
+    extern __shared__ float As_Bs[];
 
+    float* A_s = (float*) As_Bs;
+    float* B_s = (float*) As_Bs + Adz_sz;
+
+    unsigned int TILE_DIM = blockDim.x;
     unsigned int row = blockIdx.y * TILE_DIM + threadIdx.y;
     unsigned int col = blockIdx.x * TILE_DIM + threadIdx.x;
 
     float sum = 0.0f;
-
-    // Loop over tiles of the input matrices
     for (unsigned int tile = 0; tile < (k + TILE_DIM - 1) / TILE_DIM; ++tile) {
-        // Load elements of the current tile of A and B into shared memory
         if (row < m && (tile * TILE_DIM + threadIdx.x) < k) {
-            A_s[threadIdx.y][threadIdx.x] = A_d[row * k + tile * TILE_DIM + threadIdx.x];
-        } else {
-            A_s[threadIdx.y][threadIdx.x] = 0.0f;
+            A_s[threadIdx.y * TILE_DIM + threadIdx.x] = A_d[row * k + tile * TILE_DIM + threadIdx.x];
+        } 
+        else {
+            A_s[threadIdx.y * TILE_DIM + threadIdx.x] = 0.0f;
         }
 
-        // Load elements of the current tile of B into shared memory
         if (col < n && (tile * TILE_DIM + threadIdx.y) < k) {
-            B_s[threadIdx.y][threadIdx.x] = B_d[(tile * TILE_DIM + threadIdx.y) * n + col];
-        } else {
-            B_s[threadIdx.y][threadIdx.x] = 0.0f;
+            B_s[threadIdx.y * TILE_DIM + threadIdx.x] = B_d[(tile * TILE_DIM + threadIdx.y) * n + col];
+        } 
+        else {
+            B_s[threadIdx.y * TILE_DIM + threadIdx.x] = 0.0f;
         }
 
         __syncthreads();
 
-        // Accumulate the results
         for (unsigned int i = 0; i < TILE_DIM; ++i) {
-            sum += A_s[threadIdx.y][i] * B_s[i][threadIdx.x];
+            sum += A_s[threadIdx.y * TILE_DIM + i] * B_s[i * TILE_DIM + threadIdx.x];
         }
 
         __syncthreads();
@@ -87,6 +89,7 @@ __global__ void matrixMulKernel_tiled(int m, int k, int n, const float *A_d, con
         C_d[row * n + col] = sum;
     }
 }
+
 
 void basicSgemm_d_1thread1element(int m, int k, int n, const float *A_h, const float *B_h, float* C_h){
     double startTime, endTime;
@@ -140,20 +143,60 @@ void basicSgemm_d_1thread1element(int m, int k, int n, const float *A_h, const f
     CHECK(cudaFree(C_d));
 }
 
-void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h, float* C_h){
+int calculate_TILE_DIM(int m, int k, int n) {
+    cudaDeviceProp devProp;
+    CHECK(cudaGetDeviceProperties(&devProp, 0));
+
+    size_t sharedMemPerBlock = devProp.sharedMemPerBlock;
+
+    // Calculate initial TILE_DIM based on available shared memory
+    int TILE_DIM = (int)(sqrt(sharedMemPerBlock / (2 * sizeof(float))));
+
+    // CHECK TILE_DIM does not exceed matrix dimensions
+    TILE_DIM = min(TILE_DIM, m);
+    TILE_DIM = min(TILE_DIM, n);
+
+    // For small matrices, allow TILE_DIM to be smaller than warpSize if needed
+    if (TILE_DIM < devProp.warpSize) {
+        TILE_DIM = max(1, TILE_DIM);
+    } 
+    else {
+        // Round down to the nearest multiple of warpSize (32) for larger matrices
+        TILE_DIM = (TILE_DIM / devProp.warpSize) * devProp.warpSize;
+    }
+
+    // Check if the calculated size fits in shared memory
+    size_t size = 2 * TILE_DIM * TILE_DIM * sizeof(float);
+
+    // Adjusting TILE_DIM if 'size' is larger than sharedMemPerBlock
+    while (size > sharedMemPerBlock && TILE_DIM > 0) {
+        TILE_DIM -= devProp.warpSize;
+        size = 2 * TILE_DIM * TILE_DIM * sizeof(float);
+    }
+    if (TILE_DIM <= 0){
+        printf("Unable to find a valid TILE_DIM that fits in shared memory\n");
+        return -1;
+    }
+
+    // Adjusting TILE_DIM if threadsPerBlock is larger than hardware's max threads per block
+    if (TILE_DIM*TILE_DIM > devProp.maxThreadsPerBlock){
+        TILE_DIM = TILE_DIM/((TILE_DIM*TILE_DIM)/devProp.maxThreadsPerBlock);
+    }
+    return TILE_DIM;
+}
+
+void basicSgemm_d_tiled(int m, int k, int n, const float *A_h, const float *B_h, float* C_h) {
     double startTime, endTime;
-    
+
     // (1) Allocate device memory
     float *A_d, *B_d, *C_d;
-    cudaDeviceProp devProp;
-    cudaGetDeviceProperties(&devProp, 0);
-    
-    size_t size = calculate_appropriate_SM_usage(TILE_DIM, elementSize, numMatrices, devProp.sharedMemPerBlock);
+    int TILE_DIM = calculate_TILE_DIM(m, k, n);
+    size_t size = 2 * TILE_DIM * TILE_DIM * sizeof(float);
 
     startTime = myCPUTimer();
-    CHECK(cudaMalloc((void**) &A_d, sizeof(float) * m * k));
-    CHECK(cudaMalloc((void**) &B_d, sizeof(float) * k * n));
-    CHECK(cudaMalloc((void**) &C_d, sizeof(float) * m * n));
+    CHECK(cudaMalloc((void**)&A_d, sizeof(float) * m * k));
+    CHECK(cudaMalloc((void**)&B_d, sizeof(float) * k * n));
+    CHECK(cudaMalloc((void**)&C_d, sizeof(float) * m * n));
     cudaDeviceSynchronize();
     endTime = myCPUTimer();
 
@@ -175,11 +218,11 @@ void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h
     dim3 gridDim((n + blockDim.x - 1) / blockDim.x, (m + blockDim.y - 1) / blockDim.y);
 
     startTime = myCPUTimer();
-    matrixMulKernel_tiled<<<gridDim, blockDim>>>(m, k, n, A_d, B_d, C_d, size/2, size/2);
+    matrixMulKernel_tiled<<<gridDim, blockDim, size>>>(m, k, n, A_d, B_d, C_d, TILE_DIM*TILE_DIM, TILE_DIM*TILE_DIM);
     CHECK(cudaDeviceSynchronize());
     endTime = myCPUTimer();
 
-    printf("    matrixMulKernel_tiled<<<(%d, %d, %d),(%d, %d, %d)>>>:                   %f s\n", gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, endTime - startTime);
+    printf("    matrixMulKernel_tiled<<<(%d, %d),(%d, %d),(%d)>>>:                           %f s\n", gridDim.x, gridDim.y, blockDim.x, blockDim.y, size, endTime - startTime);
     fflush(stdout);
 
     // (4) Copy the result data from the device memory to the host memory
@@ -195,6 +238,8 @@ void basicSgemm_d_tiled (int m, int k, int n, const float *A_h, const float *B_h
     CHECK(cudaFree(B_d));
     CHECK(cudaFree(C_d));
 }
+
+
 
 bool verify(float* CPU_Answer, float* GPU_Answer, unsigned int nRows, unsigned int nCols) {
     unsigned int total = nRows * nCols; 
@@ -254,16 +299,16 @@ int main( int argc, char** argv){
     printf("basicSgemm_d_1thread1element (GPU):                                                  %f s\n\n", endTime -startTime);
     fflush(stdout);
 
-    // basicSgemm_d_1thread1column (GPU)
+    // basicSgemm_d_1thread1element (GPU)
     startTime = myCPUTimer();
-    basicSgemm_d_1thread1column(m, k, n, A_h, B_h, C_h);
+    basicSgemm_d_tiled(m, k, n, A_h, B_h, C_h);
     endTime = myCPUTimer();
 
     isVerified = verify(CPU_Answer, C_h, m, n);
-    printf("    Verified Results:                                                                %s\n", isVerified ? "SUCCESS" : "FAILED");
+    printf("    Verification Results:                                                            %s\n", isVerified ? "SUCCESS" : "FAILED");
     fflush(stdout);
 
-    printf("basicSgemm_d_tiled (GPU):                                                   %f s\n\n", endTime -startTime);
+    printf("basicSgemm_d_tiled (GPU):                                                            %f s\n\n", endTime -startTime);
     fflush(stdout);
 
     free(A_h);

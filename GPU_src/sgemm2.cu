@@ -255,7 +255,6 @@ bool verify(float* CPU_Answer, float* GPU_Answer, unsigned int nRows, unsigned i
 }
 
 int main( int argc, char** argv){
-    // setting dimensions (m * k * n)
     unsigned int m = atoi(argv[1]);
     unsigned int k = atoi(argv[2]);
     unsigned int n = atoi(argv[3]);
@@ -299,7 +298,7 @@ int main( int argc, char** argv){
     printf("basicSgemm_d_1thread1element (GPU):                                                  %f s\n\n", endTime -startTime);
     fflush(stdout);
 
-    // basicSgemm_d_1thread1element (GPU)
+    // basicSgemm_d_tiled (GPU)
     startTime = myCPUTimer();
     basicSgemm_d_tiled(m, k, n, A_h, B_h, C_h);
     endTime = myCPUTimer();
